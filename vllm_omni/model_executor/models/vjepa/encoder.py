@@ -314,6 +314,7 @@ class TracingHooks:
     def __init__(self, device: str, metrics: VJepa2Metrics | None = None):
         self.device = device
         self.metrics = metrics
+        self.clip_index: int = 0
         self._active_spans: dict[int, tuple[str, int]] = {}
         self._handles: list = []
         self._otel_enabled = is_tracing_available()
@@ -351,7 +352,11 @@ class TracingHooks:
                         span_name=name,
                         start_time=start_ns,
                         end_time=end_ns,
-                        attributes={"component": "vjepa2", "device": self.device},
+                        attributes={
+                            "component": "vjepa2",
+                            "device": self.device,
+                            "clip_index": self.clip_index,
+                        },
                     )
 
         return hook

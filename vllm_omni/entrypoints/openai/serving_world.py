@@ -855,8 +855,11 @@ class OmniOpenAIServingWorld:
         Returns:
             Logits tensor from model output.
         """
-        with trace_span("clip_inference", clip_index=clip_index, num_frames=clip.shape[0], is_final=is_final):
-            with trace_span("input_preprocess", num_frames=clip.shape[0], is_final=is_final):
+        if self._tracing_hooks is not None:
+            self._tracing_hooks.clip_index = clip_index
+
+        with trace_span("clip_inference", clip_index=clip_index, num_frames=clip.shape[0], is_final=is_final, head=head or ""):
+            with trace_span("input_preprocess", clip_index=clip_index, num_frames=clip.shape[0], is_final=is_final):
                 clip_np = clip.cpu().numpy()
 
                 if clip_np.ndim == 4 and clip_np.shape[1] in (1, 3, 4):
