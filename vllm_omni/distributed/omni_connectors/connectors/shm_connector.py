@@ -84,15 +84,35 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
         obj = None
+        data_bytes = None
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
                 data_bytes = shm_read_bytes(shm_handle)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
+
+            if not data_bytes or len(data_bytes) == 0:
+                logger.warning(
+                    "SharedMemoryConnector: empty data from SHM segment %s",
+                    shm_handle.get("name", "unknown"),
+                )
+                return None
+
             obj = self.deserialize_obj(data_bytes)
             return obj, int(shm_handle.get("size", 0))
+
         except Exception as e:
-            logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
+            data_len = len(data_bytes) if data_bytes else 0
+            data_preview = ""
+            if data_bytes and len(data_bytes) > 0:
+                data_preview = f", first8={data_bytes[:8].hex() if len(data_bytes) >= 8 else data_bytes.hex()}"
+            logger.error(
+                "SharedMemoryConnector get failed for %s: %s (data_len=%d%s)",
+                shm_handle.get("name", "unknown"),
+                e,
+                data_len,
+                data_preview,
+            )
             return None
         finally:
             # If data has been received, delete lock_file.
