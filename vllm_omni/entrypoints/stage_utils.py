@@ -150,27 +150,37 @@ def serialize_obj(obj: Any) -> bytes:
     return OmniSerializer.serialize(obj)
 
 
+_SHM_HEADER_SIZE = 8
+
+
 def shm_write_bytes(payload: bytes, name: str | None = None) -> dict[str, Any]:
     """Write bytes into SharedMemory and return meta dict {name,size}.
 
+    The first 8 bytes are a header containing the payload size as uint64,
+    allowing readers to determine exact payload size without external metadata.
+
     Caller should close the segment; the receiver should unlink.
     """
+    import struct
+
+    total_size = _SHM_HEADER_SIZE + len(payload)
     try:
-        shm = _shm.SharedMemory(create=True, size=len(payload), name=name)
+        shm = _shm.SharedMemory(create=True, size=total_size, name=name)
     except FileExistsError:
         if name:
-            # If name is specified and exists, unlink it and try again
             try:
                 existing = _shm.SharedMemory(name=name)
                 existing.unlink()
             except Exception:
                 pass
-            shm = _shm.SharedMemory(create=True, size=len(payload), name=name)
+            shm = _shm.SharedMemory(create=True, size=total_size, name=name)
         else:
             raise
 
     mv = memoryview(shm.buf)
-    mv[: len(payload)] = payload
+    header_bytes = struct.pack("<Q", len(payload))
+    mv[:_SHM_HEADER_SIZE] = header_bytes
+    mv[_SHM_HEADER_SIZE : _SHM_HEADER_SIZE + len(payload)] = payload
     del mv
     meta = {"name": shm.name, "size": len(payload)}
     try:
@@ -181,10 +191,25 @@ def shm_write_bytes(payload: bytes, name: str | None = None) -> dict[str, Any]:
 
 
 def shm_read_bytes(meta: dict[str, Any]) -> bytes:
-    """Read bytes from SharedMemory by meta {name,size} and cleanup."""
-    shm = _shm.SharedMemory(name=meta["name"])  # type: ignore[index]
+    """Read bytes from SharedMemory by meta {name,size} and cleanup.
+
+    Reads the 8-byte header to determine payload size, falling back to
+    meta['size'] for backward compatibility.
+    """
+    import struct
+
+    shm = _shm.SharedMemory(name=meta["name"])
     mv = memoryview(shm.buf)
-    data = bytes(mv[: meta["size"]])
+
+    if shm.size >= _SHM_HEADER_SIZE:
+        payload_size = struct.unpack("<Q", bytes(mv[:_SHM_HEADER_SIZE]))[0]
+        if 0 < payload_size <= shm.size - _SHM_HEADER_SIZE:
+            data = bytes(mv[_SHM_HEADER_SIZE : _SHM_HEADER_SIZE + payload_size])
+        else:
+            data = bytes(mv[: meta["size"]])
+    else:
+        data = bytes(mv[: meta["size"]])
+
     del mv
     try:
         shm.close()

@@ -565,11 +565,8 @@ class VJepa2Model(nn.Module):
         # For pooling models, vLLM expects hidden states of shape (batch, seq_len, hidden_size)
         # not final logits. This is used during model profiling for memory allocation.
         if pixel_values is None and frames is None:
-            # Return dummy hidden states for warmup run
-            # Shape: (batch=1, seq_len=1, hidden_size) - V-JEPA ViT-L has hidden_size=1024
-            hidden_size = getattr(self._model.config, "hidden_size", 1024)
-            dummy_hidden = torch.zeros(1, 1, hidden_size, device=self._device)
-            return dummy_hidden
+            hidden_size = getattr(self._model.config, "hidden_size", 1024) if self._model else 1024
+            return torch.zeros(1, 1, hidden_size, device=self._device or "cpu")
 
         # Record input_preprocess span
         preprocess_start = time.perf_counter_ns()
@@ -817,6 +814,8 @@ class VJepa2Encoder(nn.Module):
         if model_id is None:
             model_id = "facebook/vjepa2-vitl-fpc16-256-ssv2"
 
+        self._hf_hidden_size = getattr(hf_config, "hidden_size", 1024)
+
         config = VJepa2Config(
             model_id=model_id,
             num_frames=getattr(hf_config, "num_frames", 16),
@@ -860,6 +859,16 @@ class VJepa2Encoder(nn.Module):
             None: When streaming and clip not yet ready
         """
         head_name = kwargs.pop("head", None)
+
+        # vLLM profiling/KV-cache sizing: no video inputs, just dummy token IDs.
+        # Return hidden states with the correct dimension so the pooler warmup
+        # doesn't crash on shape mismatch. Real inference always has tensor,
+        # pixel_values, or frames in kwargs.
+        has_video_input = any(kwargs.get(k) is not None
+                             for k in ("tensor", "pixel_values", "frames"))
+        if not has_video_input:
+            device = self._impl._device or "cpu"
+            return torch.zeros(1, 1, self._hf_hidden_size, device=device)
 
         # If a specific head is requested and heads are registered, route
         if head_name is not None and self._heads:
@@ -1035,8 +1044,7 @@ class VJepa2Encoder(nn.Module):
             pass
 
         # Report all model params plus vLLM adapter aliases as loaded.
-        # Use self.named_parameters() so names include the full module path
-        # (e.g. _impl._model.vjepa2.encoder...) matching what vLLM validates.
         loaded = {n for n, _ in self.named_parameters()}
-        loaded.update(("score.weight", "score.bias"))
+        loaded.update(("score.weight", "score.bias",
+                       "classifier.weight", "classifier.bias"))
         return loaded

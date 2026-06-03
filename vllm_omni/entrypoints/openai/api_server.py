@@ -128,6 +128,17 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage, ReferenceVideo
 from vllm_omni.entrypoints.openai.serving_video_stream import OmniStreamingVideoHandler
+from vllm_omni.entrypoints.openai.serving_world import OmniOpenAIServingWorld
+from vllm_omni.entrypoints.openai.protocol.world import (
+    WorldHeadsResponse,
+    WorldPredictionEvent,
+    WorldSessionCreateRequest,
+    WorldSessionCreateResponse,
+    WorldSessionDeleteResponse,
+    WorldSessionListResponse,
+    WorldSessionStatusResponse,
+    WorldUploadResponse,
+)
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
     get_default_sampling_params_list,
@@ -663,14 +674,15 @@ async def omni_init_app_state(
     vllm_config = await _get_vllm_config(engine_client)
 
     # Detect if it's pure Diffusion mode (single stage and is Diffusion)
+    # Also handles V-JEPA stages which don't require tokenizers
     is_pure_diffusion = False
+    non_llm_stage_types = {"diffusion", "jepa_encoder", "jepa_predictor"}
     if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
         stage_configs = engine_client.stage_configs
-        if len(stage_configs) == 1:
-            stage_type = get_stage_type(stage_configs[0])
-            if stage_type == "diffusion":
-                is_pure_diffusion = True
-                logger.info("Detected pure diffusion mode (single diffusion stage)")
+        stage_types = {get_stage_type(cfg) for cfg in stage_configs}
+        if stage_types and stage_types.issubset(non_llm_stage_types):
+            is_pure_diffusion = True
+            logger.info("Detected non-LLM mode (stages: %s)", stage_types)
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
@@ -733,6 +745,11 @@ async def omni_init_app_state(
         state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
             engine_client=engine_client,
             model_name=model_name,
+        )
+        state.openai_serving_world = OmniOpenAIServingWorld.for_diffusion(
+            diffusion_engine=engine_client,
+            model_name=model_name,
+            stage_configs=diffusion_stage_configs,
         )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
@@ -1074,8 +1091,35 @@ async def omni_init_app_state(
     )
     state.openai_serving_realtime_robot = None
 
+    # World model serving (V-JEPA)
+    heads_config: list[dict] | None = None
+    try:
+        from vllm_omni.config.stage_config import load_deploy_config
+        deploy_dir = Path(__file__).resolve().parent.parent.parent / "deploy"
+        for yaml_file in sorted(deploy_dir.glob("*.yaml")):
+            try:
+                dc = load_deploy_config(yaml_file)
+                if dc.heads:
+                    heads_config = dc.heads
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    state.openai_serving_world = OmniOpenAIServingWorld(
+        engine_client=engine_client,
+        model_name=model_name,
+        stage_configs=state.stage_configs,
+        heads_config=heads_config,
+    )
+
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
+
+
+def Omniworld(request: Request) -> OmniOpenAIServingWorld | None:
+    return request.app.state.openai_serving_world
 
 
 def Omnivideo(request: Request) -> OmniOpenAIServingVideo | None:
@@ -3234,6 +3278,273 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
         if sid in sleeping_set:
             sleeping_set.remove(sid)
     return {"status": "SUCCESS", "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) else a for a in acks]}
+
+
+
+# World Model API endpoints (V-JEPA)
+
+
+@router.get(
+    "/v1/world/heads",
+    response_model=WorldHeadsResponse,
+    responses={
+        HTTPStatus.OK.value: {"model": WorldHeadsResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+    },
+)
+async def list_world_heads(
+    raw_request: Request,
+) -> WorldHeadsResponse:
+    handler = Omniworld(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="World model API not available",
+        )
+    return await handler.list_heads()
+
+
+@router.post(
+    "/v1/world/upload",
+    response_model=WorldUploadResponse,
+    responses={
+        HTTPStatus.OK.value: {"model": WorldUploadResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+    },
+)
+async def upload_world_video(
+    raw_request: Request,
+    file: UploadFile = File(...),
+) -> WorldUploadResponse:
+    handler = Omniworld(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="World model API not available",
+        )
+    content = await file.read()
+    return await handler.upload_video(
+        content=content,
+        filename=file.filename or "video.mp4",
+        content_type=file.content_type or "video/mp4",
+    )
+
+
+@router.post(
+    "/v1/world/session",
+    response_model=WorldSessionCreateResponse,
+    responses={
+        HTTPStatus.OK.value: {"model": WorldSessionCreateResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+    },
+)
+async def create_world_session(
+    request: WorldSessionCreateRequest,
+    raw_request: Request,
+) -> WorldSessionCreateResponse:
+    handler = Omniworld(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="World model API not available",
+        )
+    try:
+        return await handler.open_session(request)
+    except Exception as e:
+        logger.exception("Failed to create world session: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail=str(e),
+        )
+
+
+@router.get(
+    "/v1/world/session/{session_id}",
+    response_model=WorldSessionStatusResponse,
+    responses={
+        HTTPStatus.OK.value: {"model": WorldSessionStatusResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+    },
+)
+async def get_world_session(
+    session_id: str,
+    raw_request: Request,
+) -> WorldSessionStatusResponse:
+    handler = Omniworld(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="World model API not available",
+        )
+    result = await handler.get_session(session_id)
+    if result is None:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND.value,
+            detail=f"Session not found: {session_id}",
+        )
+    return result
+
+
+@router.delete(
+    "/v1/world/session/{session_id}",
+    response_model=WorldSessionDeleteResponse,
+    responses={
+        HTTPStatus.OK.value: {"model": WorldSessionDeleteResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+    },
+)
+async def delete_world_session(
+    session_id: str,
+    raw_request: Request,
+) -> WorldSessionDeleteResponse:
+    handler = Omniworld(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="World model API not available",
+        )
+    try:
+        return await handler.close_session(session_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND.value,
+            detail=f"Session not found: {session_id}",
+        )
+    except Exception as e:
+        logger.exception("Failed to delete world session %s: %s", session_id, e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail=str(e),
+        )
+
+
+@router.get(
+    "/v1/world/session/{session_id}/predictions",
+    responses={
+        HTTPStatus.OK.value: {"content": {"text/event-stream": {}}},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+    },
+)
+async def stream_world_predictions(
+    session_id: str,
+    raw_request: Request,
+):
+    handler = Omniworld(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="World model API not available",
+        )
+
+    session_status = await handler.get_session(session_id)
+    if session_status is None:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND.value,
+            detail=f"Session not found: {session_id}",
+        )
+
+    if not handler.gstreamer_available:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="GStreamer not available - video streaming disabled",
+        )
+
+    async def generate_events():
+        try:
+            async for event in handler.stream_predictions(session_id):
+                if await raw_request.is_disconnected():
+                    logger.info("Client disconnected from world session %s", session_id)
+                    break
+                yield f"data: {event.model_dump_json()}\n\n"
+        except asyncio.CancelledError:
+            logger.info("SSE stream cancelled for world session %s", session_id)
+        except Exception as e:
+            logger.exception("Error in SSE stream for world session %s: %s", session_id, e)
+            error_event = WorldPredictionEvent(error=str(e))
+            yield f"data: {error_event.model_dump_json()}\n\n"
+
+    return StreamingResponse(
+        generate_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get(
+    "/v1/world/sessions",
+    response_model=WorldSessionListResponse,
+    responses={
+        HTTPStatus.OK.value: {"model": WorldSessionListResponse},
+    },
+)
+async def list_world_sessions(
+    raw_request: Request,
+) -> WorldSessionListResponse:
+    handler = Omniworld(raw_request)
+    if handler is None:
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail="World model API not available",
+        )
+    return await handler.list_sessions()
+
+
+# KServe-compatible benchmark endpoints (V-JEPA)
+
+
+@router.get("/v2/health/ready")
+async def health_ready(raw_request: Request) -> JSONResponse:
+    handler = Omniworld(raw_request)
+    if handler is None:
+        return JSONResponse(
+            {"status": "loading", "model": "unknown"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+    model_name = getattr(handler._model.config, "_name_or_path", "vjepa2")
+    device = str(handler._device)
+    return JSONResponse({"status": "ready", "model": model_name, "device": device})
+
+
+@router.post("/v2/models/vjepa2/infer")
+async def infer_video(
+    raw_request: Request,
+    file: UploadFile = File(...),
+    top_k: int = Form(default=5),
+    num_frames: int = Form(default=16),
+    stride: int | None = Form(default=None),
+    obs_timestamp_ms: int | None = Form(default=None),
+) -> JSONResponse:
+    handler = Omniworld(raw_request)
+    if handler is None:
+        return JSONResponse(
+            {"error": "Model not ready"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+    try:
+        content = await file.read()
+        result = await handler.infer_video(
+            content=content,
+            filename=file.filename or "video.mp4",
+            num_frames=num_frames,
+            stride=stride,
+            top_k=top_k,
+            obs_timestamp_ms=obs_timestamp_ms,
+        )
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("Inference failed: %s", e)
+        return JSONResponse(
+            {"error": f"Could not decode video: {e}"},
+            status_code=400,
+        )
 
 
 if __name__ == "__main__":
