@@ -144,6 +144,8 @@ class StageType(str, Enum):
     # TODO(@lishunyang12): remove once all models migrate to StageExecutionType
     LLM = "llm"
     DIFFUSION = "diffusion"
+    JEPA_ENCODER = "jepa_encoder"
+    JEPA_PREDICTOR = "jepa_predictor"
 
 
 class StageExecutionType(str, Enum):
@@ -152,6 +154,8 @@ class StageExecutionType(str, Enum):
     LLM_AR = "llm_ar"
     LLM_GENERATION = "llm_generation"
     DIFFUSION = "diffusion"
+    JEPA_ENCODER = "jepa_encoder"
+    JEPA_PREDICTOR = "jepa_predictor"
 
 
 def _resolve_scheduler(
@@ -169,6 +173,8 @@ def _resolve_scheduler(
             return OmniARScheduler
         return OmniARAsyncScheduler
     if execution_type == StageExecutionType.LLM_GENERATION:
+        return OmniGenerationScheduler
+    if execution_type in (StageExecutionType.JEPA_ENCODER, StageExecutionType.JEPA_PREDICTOR):
         return OmniGenerationScheduler
     # Diffusion currently returns None here.
     return None
@@ -517,6 +523,8 @@ class DeployConfig:
     pipeline_parallel_size: int | None = None
     custom_voice_dir: str | None = None
 
+    heads: list[dict[str, Any]] | None = None
+
 
 _STAGE_RESERVED_KEYS = frozenset(
     {
@@ -698,6 +706,8 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     ):
         if name in raw_dict:
             kwargs[name] = raw_dict[name]
+    if "heads" in raw_dict:
+        kwargs["heads"] = raw_dict["heads"]
     return DeployConfig(**kwargs)
 
 
@@ -781,6 +791,8 @@ _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str |
     StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
     StageExecutionType.LLM_GENERATION: (StageType.LLM, "generation"),
     StageExecutionType.DIFFUSION: (StageType.DIFFUSION, None),
+    StageExecutionType.JEPA_ENCODER: (StageType.JEPA_ENCODER, "generation"),
+    StageExecutionType.JEPA_PREDICTOR: (StageType.JEPA_PREDICTOR, "generation"),
 }
 
 

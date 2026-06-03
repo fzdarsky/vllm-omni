@@ -317,6 +317,21 @@ _OMNI_MODELS = {
         "minicpmo_4_5_omni_tts",
         "MiniCPMO45OmniTTSForConditionalGeneration",
     ),
+    "VJEPA2ForVideoClassification": (
+        "vjepa",
+        "encoder",
+        "VJepa2Encoder",
+    ),
+    "VJepa2EncoderForConditionalGeneration": (
+        "vjepa",
+        "encoder",
+        "VJepa2Encoder",
+    ),
+    "VJepa2PredictorForConditionalGeneration": (
+        "vjepa",
+        "predictor",
+        "VJepa2Predictor",
+    ),
 }
 
 

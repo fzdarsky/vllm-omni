@@ -1,0 +1,48 @@
+# V-JEPA Single-Stage Pipeline Configuration
+#
+# Architecture (Single-Stage):
+#   VisionIOProcessor → VJepa2Model (full HuggingFace model) → Logits
+#
+# The HuggingFace model includes encoder, predictor, pooler, and classifier.
+# Forward hooks provide V-JEPA spans for per-component tracing:
+#   - jepa_encode: model.vjepa2.encoder
+#   - jepa_predict: model.vjepa2.predictor
+#   - jepa_pool: model.pooler
+#
+# Model Variants:
+#   Model parameters are loaded from the HuggingFace config.json.
+#
+#   Examples:
+#     --model facebook/vjepa2-vitl-fpc16-256-ssv2  # ViT-L, 256x256, SSv2
+#     --model facebook/vjepa2-vitg-fpc16-384-ssv2  # ViT-G, 384x384, SSv2
+#
+# For two-stage architecture with action conditioning, see pipeline_twostage.yaml
+
+model_type: vjepa2
+async_chunk: false  # Single-stage doesn't need async chunking
+
+stages:
+  # Stage 0: V-JEPA Full Model (HuggingFace wrapper)
+  - stage_id: 0
+    model_stage: encoder
+    stage_type: jepa_encoder
+    is_comprehension: true
+    input_sources: []
+    worker_type: generation
+    scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+    final_output: true
+    final_output_type: prediction
+    runtime:
+      devices: "0"
+    engine_args:
+      max_num_seqs: 8
+      # Use HuggingFace config.json directly (VJEPA2ForVideoClassification)
+      # No model_arch override needed - detected from config.json
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: prediction
+      gpu_memory_utilization: 0.6
+      distributed_executor_backend: "mp"
+      skip_tokenizer_init: true

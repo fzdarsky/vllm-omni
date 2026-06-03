@@ -1,0 +1,41 @@
+# V-JEPA 2 Deploy Configuration
+#
+# Single-stage world model for video understanding.
+# Uses generation worker (non-AR one-shot inference).
+#
+# Usage:
+#   vllm serve facebook/vjepa2-vitl-fpc16-256-ssv2 --omni --trust-remote-code
+#
+# Pipeline: encoder stage only (HuggingFace model includes predictor + pooler)
+
+# async_chunk disabled - single-stage pipeline doesn't need streaming between stages
+async_chunk: false
+
+# Pipeline reference (matches pipeline_registry.py)
+pipeline: vjepa2
+
+stages:
+  - stage_id: 0
+    runtime:
+      process: true
+      devices: "0"
+    engine_args:
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      gpu_memory_utilization: 0.6
+      max_num_seqs: 8
+      skip_tokenizer_init: true
+
+# Classification heads (multi-head serving)
+#
+# Each head is a (pooler + classifier) pair loaded at startup.
+# The default head is extracted from the model checkpoint.
+# Additional heads are loaded from separate checkpoint files.
+# Labels auto-discovered from head_meta.json if not specified.
+heads:
+  - name: ssv2
+    default: true
+  - name: diving48
+    checkpoint: /heads/diving48/head.pt
+    num_labels: 48

@@ -161,4 +161,8 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.dynin_omni.pipeline",
         "DYNIN_OMNI_PIPELINE",
     ),
+    "vjepa2": (
+        "vllm_omni.model_executor.models.vjepa.pipeline",
+        "VJEPA2_PIPELINE",
+    ),
 }
