@@ -1,22 +1,138 @@
-ARG BASE_IMAGE=vllm/vllm-openai:v0.22.0
+# vLLM-Omni CUDA Image
+#
+# Build: podman build -f docker/Dockerfile.cuda -t vllm-omni:cuda .
+# Run:   podman run --rm -p 8080:8080 --device nvidia.com/gpu=all vllm-omni:cuda
+#
+# Supply Chain:
+#   - Base: vLLM official (docker.io/vllm/vllm-openai)
+#   - System packages: Debian/Ubuntu repositories
+#   - Python packages: PyPI
+
+ARG BASE_IMAGE=docker.io/vllm/vllm-openai:v0.22.0
 FROM ${BASE_IMAGE}
 
 ARG COMMON_WORKDIR=/app
 
 WORKDIR ${COMMON_WORKDIR}
 
-# Step 1: Setup - Install system dependencies
+# =============================================================================
+# System dependencies
+# =============================================================================
+# - GStreamer: video decode with hardware acceleration (NVDEC via nvv4l2decoder)
+# - GObject introspection: Python bindings for GStreamer
+# - Audio/TTS: espeak-ng, ffmpeg, sox for vLLM-Omni audio pipelines
+# - Build tools: git, jq for CI/CD
 RUN apt-get update && \
-    apt-get install -y git jq && \
+    apt-get install -y --no-install-recommends \
+      # Build tools
+      git \
+      jq \
+      # GStreamer core and plugins
+      gstreamer1.0-tools \
+      gstreamer1.0-plugins-base \
+      gstreamer1.0-plugins-good \
+      gstreamer1.0-plugins-bad \
+      # GStreamer Python bindings
+      python3-gi \
+      gir1.2-gstreamer-1.0 \
+      gir1.2-gst-plugins-base-1.0 \
+      # Audio/TTS support
+      espeak-ng \
+      ffmpeg \
+      sox \
+      libsox-fmt-all && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# =============================================================================
+# Python dependencies - OpenTelemetry and GStreamer bindings
+# =============================================================================
+# Note: System python3-gi is built for Python 3.10, but vLLM uses Python 3.12.
+# We must install PyGObject via pip to get the correct Python version bindings.
+# Install build deps, build PyGObject, then remove build deps to keep image small.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      libcairo2-dev \
+      libgirepository1.0-dev \
+      pkg-config && \
+    uv pip install --system --no-cache-dir \
+      'PyGObject==3.48.2' \
+      'opentelemetry-api>=1.20.0' \
+      'opentelemetry-sdk>=1.20.0' \
+      'opentelemetry-exporter-otlp>=1.20.0' \
+      'opentelemetry-instrumentation-fastapi>=0.41b0' \
+      'python-multipart>=0.0.20' \
+      'av>=13.1.0' && \
+    apt-get purge -y libcairo2-dev libgirepository1.0-dev pkg-config && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# Build moq-gst GStreamer plugin (MoQ camera streaming)
+# =============================================================================
+# moqsrc/moqsink elements enable subscribing to MoQ relay broadcasts.
+# Built from the moq-dev/moq workspace — requires Rust toolchain.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      curl \
+      libgstreamer1.0-dev \
+      libgstreamer-plugins-base1.0-dev && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal && \
+    . /root/.cargo/env && \
+    git clone --depth 1 https://github.com/moq-dev/moq.git /tmp/moq-dev && \
+    cd /tmp/moq-dev && \
+    cargo build --release -p moq-gst && \
+    cp target/release/libgstmoq.so /usr/lib/$(uname -m)-linux-gnu/gstreamer-1.0/ && \
+    rm -rf /tmp/moq-dev /root/.cargo /root/.rustup && \
+    apt-get purge -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# Install vllm-omni
+# =============================================================================
+# For development: build with --build-arg DEV_MODE=true to skip install
+# Then bind-mount vllm-omni and run: pip install -e /app/vllm-omni
+ARG DEV_MODE=false
+# Version override for builds without .git (e.g., remote builds via rsync)
+ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
+
 RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
-# Step 2: Copy vllm-omni code and install
 COPY . ${COMMON_WORKDIR}/vllm-omni
-RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+RUN if [ "$DEV_MODE" = "false" ]; then \
+      cd ${COMMON_WORKDIR}/vllm-omni && \
+      SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" \
+      uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."; \
+    else \
+      echo "DEV_MODE: skipping vllm-omni install (use bind mount + pip install -e)"; \
+    fi
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# =============================================================================
+# Runtime configuration
+# =============================================================================
+# Volume mounts for models and media
+VOLUME /model
+VOLUME /input
+VOLUME /output
+
+RUN mkdir -p /input /output /root/.cache/huggingface
+
+ENV HF_HOME=/root/.cache/huggingface
+
+# OpenTelemetry tracing (optional - set via environment)
+# Example: -e OTLP_TRACES_ENDPOINT=http://jaeger:4317
+ENV OTLP_TRACES_ENDPOINT=""
+ENV COLLECT_DETAILED_TRACES=""
+
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" || exit 1
 
 ENTRYPOINT []
