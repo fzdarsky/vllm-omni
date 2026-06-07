@@ -746,11 +746,24 @@ async def omni_init_app_state(
             engine_client=engine_client,
             model_name=model_name,
         )
-        state.openai_serving_world = OmniOpenAIServingWorld.for_diffusion(
-            diffusion_engine=engine_client,
-            model_name=model_name,
-            stage_configs=diffusion_stage_configs,
-        )
+        # For JEPA-only pipelines, use StageFeedForwardClient which runs
+        # inference in a dedicated subprocess (single model copy on GPU).
+        jepa_stage_types = {"jepa_encoder", "jepa_predictor"}
+        _stage_types = {get_stage_type(cfg) for cfg in diffusion_stage_configs} if diffusion_stage_configs else set()
+        if _stage_types and _stage_types.issubset(jepa_stage_types):
+            from vllm_omni.feed_forward.stage_client import StageFeedForwardClient
+            ff_client = StageFeedForwardClient(model_name=model_name)
+            state.openai_serving_world = OmniOpenAIServingWorld(
+                engine_client=ff_client,
+                model_name=model_name,
+                stage_configs=diffusion_stage_configs,
+            )
+        else:
+            state.openai_serving_world = OmniOpenAIServingWorld.for_diffusion(
+                diffusion_engine=engine_client,
+                model_name=model_name,
+                stage_configs=diffusion_stage_configs,
+            )
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0

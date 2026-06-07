@@ -208,11 +208,35 @@ class OmniOpenAIServingWorld:
         self._lock = asyncio.Lock()
         self._gc_task: asyncio.Task | None = None
 
-        # Load V-JEPA model directly for inference
-        # TODO: Integrate with vLLM-Omni multi-stage pipeline for production
-        self._model = None
-        self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._load_vjepa_model(model_name)
+        # Use model from InlineFeedForwardClient if available (single copy),
+        # otherwise load our own (legacy path).
+        from vllm_omni.feed_forward.inline_client import InlineFeedForwardClient
+        if isinstance(engine_client, InlineFeedForwardClient):
+            # Inline path: model in this process.
+            self._model = engine_client.model
+            self._processor = engine_client.processor
+            self._device = engine_client.device
+            self._tracing_hooks = None
+            self._register_tracing_hooks()
+            self._init_gpu_preprocess()
+            self._warmup_model()
+            from vllm_omni.feed_forward import FeedForwardEngine
+            from vllm_omni.feed_forward.data import FeedForwardConfig
+            self._engine = FeedForwardEngine(
+                config=FeedForwardConfig(model_class_name=model_name, device=self._device),
+                model_forward_fn=self._engine_forward,
+            )
+        else:
+            # Legacy path: load our own model.
+            self._model = None
+            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._load_feed_forward_model(model_name)
+            from vllm_omni.feed_forward import FeedForwardEngine
+            from vllm_omni.feed_forward.data import FeedForwardConfig
+            self._engine = FeedForwardEngine(
+                config=FeedForwardConfig(model_class_name=model_name, device=self._device),
+                model_forward_fn=self._engine_forward,
+            )
 
         # Multi-head registry (name → ClassificationHead)
         self._heads: dict[str, Any] = {}
@@ -240,69 +264,131 @@ class OmniOpenAIServingWorld:
             self._device,
         )
 
-    def _load_vjepa_model(self, model_name: str) -> None:
-        """Load V-JEPA model for direct inference.
+    def _load_feed_forward_model(self, model_name: str) -> None:
+        """Load a HuggingFace feed-forward model for inference.
 
-        For the PoC, this loads the HuggingFace model directly. In production,
-        this should integrate with vLLM-Omni's multi-stage pipeline.
+        Works with any AutoModelForVideoClassification-compatible model.
+        Tracing hooks are derived from the model's ``tracing_hooks``
+        config attribute (list of [module_path, span_name] pairs), falling
+        back to auto-discovery of encoder/predictor/pooler submodules.
         """
-        logger.info("_load_vjepa_model called: model=%s, device=%s", model_name, self._device)
+        logger.info("Loading feed-forward model: %s on %s", model_name, self._device)
 
         try:
             from transformers import AutoModelForVideoClassification, AutoVideoProcessor
 
-            logger.info("Loading V-JEPA model: %s on %s", model_name, self._device)
-
-            # V-JEPA2 requires video-specific HuggingFace classes
             self._model = AutoModelForVideoClassification.from_pretrained(
                 model_name,
                 torch_dtype=torch.float16 if self._device == "cuda" else torch.float32,
                 trust_remote_code=True,
             ).to(self._device)
-            # Set model to evaluation mode
             self._model.train(False)
 
-            # Load video processor for preprocessing
             self._processor = AutoVideoProcessor.from_pretrained(
                 model_name,
                 trust_remote_code=True,
             )
 
             logger.info(
-                "V-JEPA model loaded successfully: %s (%d labels)",
+                "Model loaded: %s (%s labels)",
                 type(self._model).__name__,
                 getattr(self._model.config, "num_labels", "unknown"),
             )
 
-            # Register tracing hooks on model submodules
-            self._tracing_hooks = TracingHooks(self._device)
-            hook_config = [
-                ("vjepa2.encoder", "jepa_encode"),
-                ("vjepa2.predictor", "jepa_predict"),
-                ("pooler", "jepa_pool"),
-            ]
-            for module_path, span_name in hook_config:
-                try:
-                    module = self._model
-                    for part in module_path.split("."):
-                        module = getattr(module, part)
-                    self._tracing_hooks.register(module, span_name)
-                    logger.info("Registered tracing hook: %s → %s", module_path, span_name)
-                except AttributeError:
-                    logger.debug("Submodule %s not found, skipping hook", module_path)
-
-            # Warmup: run a dummy forward pass to trigger CUDA kernel JIT
-            # This moves the ~2s first-inference penalty to server startup
+            self._register_tracing_hooks()
+            self._init_gpu_preprocess()
             self._warmup_model()
 
         except ImportError as e:
-            logger.warning("Cannot import transformers for V-JEPA model: %s", e)
+            logger.warning("Cannot import model: %s", e)
             self._model = None
             self._processor = None
         except Exception as e:
-            logger.exception("Failed to load V-JEPA model: %s", e)
+            logger.exception("Failed to load model: %s", e)
             self._model = None
             self._processor = None
+
+    def _register_tracing_hooks(self) -> None:
+        """Register OTel tracing hooks on model submodules.
+
+        Looks for ``tracing_hooks`` in the model config (a list of
+        ``[module_path, span_name]`` pairs). Falls back to probing
+        well-known submodule paths based on the model type name.
+        """
+        if self._model is None:
+            return
+
+        hook_config = getattr(self._model.config, "tracing_hooks", None)
+        if hook_config is None:
+            model_type = getattr(self._model.config, "model_type", "")
+            if "vjepa" in model_type:
+                hook_config = [
+                    ("vjepa2.encoder", "jepa_encode"),
+                    ("vjepa2.predictor", "jepa_predict"),
+                    ("pooler", "jepa_pool"),
+                ]
+            else:
+                hook_config = []
+
+        if not hook_config:
+            return
+
+        self._tracing_hooks = TracingHooks(self._device)
+        for module_path, span_name in hook_config:
+            try:
+                module = self._model
+                for part in module_path.split("."):
+                    module = getattr(module, part)
+                self._tracing_hooks.register(module, span_name)
+            except AttributeError:
+                logger.debug("Submodule %s not found, skipping hook", module_path)
+
+    def _init_gpu_preprocess(self) -> None:
+        """Extract preprocessing params from AutoVideoProcessor for GPU-side transforms."""
+        if self._processor is None:
+            return
+
+        import torchvision  # noqa: F401 — verify available
+
+        p = self._processor
+        size = getattr(p, "size", {})
+        self._pp_resize = size.get("shortest_edge", size.get("height", 256))
+        crop = getattr(p, "crop_size", {})
+        self._pp_crop = (crop.get("height", self._pp_resize), crop.get("width", self._pp_resize))
+        self._pp_mean = torch.tensor(
+            getattr(p, "image_mean", [0.485, 0.456, 0.406]),
+            device=self._device, dtype=torch.float32,
+        ).view(1, 3, 1, 1)
+        self._pp_std = torch.tensor(
+            getattr(p, "image_std", [0.229, 0.224, 0.225]),
+            device=self._device, dtype=torch.float32,
+        ).view(1, 3, 1, 1)
+        self._gpu_preprocess_available = True
+        logger.info(
+            "GPU preprocessing initialized: resize=%d, crop=%s, device=%s",
+            self._pp_resize, self._pp_crop, self._device,
+        )
+
+    def _preprocess_on_gpu(self, clip: torch.Tensor) -> torch.Tensor:
+        """Preprocess clip entirely on GPU. No CPU round-trip.
+
+        Params (resize, crop, mean, std) are derived from the model's
+        video_preprocessor_config.json via _init_gpu_preprocess().
+        """
+        import torchvision.transforms.functional as F
+
+        # Ensure CHW format
+        if clip.ndim == 4 and clip.shape[-1] == 3:
+            clip = clip.permute(0, 3, 1, 2)
+
+        clip = clip.to(device=self._device, dtype=torch.float32)
+        if clip.max() > 1.0:
+            clip = clip / 255.0
+
+        clip = F.resize(clip, self._pp_resize, antialias=True)
+        clip = F.center_crop(clip, list(self._pp_crop))
+        clip = (clip - self._pp_mean) / self._pp_std
+        return clip.unsqueeze(0)  # (1, T, C, H, W)
 
     def _warmup_model(self) -> None:
         """Run a dummy forward pass to trigger CUDA kernel compilation.
@@ -860,39 +946,28 @@ class OmniOpenAIServingWorld:
 
         with trace_span("clip_inference", clip_index=clip_index, num_frames=clip.shape[0], is_final=is_final, head=head or ""):
             with trace_span("input_preprocess", clip_index=clip_index, num_frames=clip.shape[0], is_final=is_final):
-                clip_np = clip.cpu().numpy()
-
-                if clip_np.ndim == 4 and clip_np.shape[1] in (1, 3, 4):
-                    clip_np = np.transpose(clip_np, (0, 2, 3, 1))
-
-                if clip_np.dtype != np.uint8:
-                    if clip_np.max() <= 1.0:
-                        clip_np = (clip_np * 255).astype(np.uint8)
-                    else:
-                        clip_np = clip_np.astype(np.uint8)
-
-                if is_final:
-                    inputs = self._processor(videos=list(clip_np), return_tensors="pt")
+                if getattr(self, "_gpu_preprocess_available", False):
+                    pixel_values = self._preprocess_on_gpu(clip)
                 else:
-                    inputs = self._processor(list(clip_np), return_tensors="pt")
-
-            pixel_key = (
-                "pixel_values_videos"
-                if "pixel_values_videos" in inputs
-                else "pixel_values"
-            )
+                    clip_np = clip.cpu().numpy()
+                    if clip_np.ndim == 4 and clip_np.shape[1] in (1, 3, 4):
+                        clip_np = np.transpose(clip_np, (0, 2, 3, 1))
+                    if clip_np.dtype != np.uint8:
+                        if clip_np.max() <= 1.0:
+                            clip_np = (clip_np * 255).astype(np.uint8)
+                        else:
+                            clip_np = clip_np.astype(np.uint8)
+                    if is_final:
+                        inputs = self._processor(videos=list(clip_np), return_tensors="pt")
+                    else:
+                        inputs = self._processor(list(clip_np), return_tensors="pt")
+                    pixel_key = "pixel_values_videos" if "pixel_values_videos" in inputs else "pixel_values"
+                    pixel_values = inputs[pixel_key].to(self._device)
 
             # Resolve which head to use
             selected_head = self._heads.get(head) if head else None
             if selected_head is None and head is not None:
                 selected_head = self._heads.get(self._default_head)
-
-            if is_final:
-                device = next(self._model.parameters()).device
-                inputs_on_device = {k: v.to(device) for k, v in inputs.items()}
-                pixel_values = inputs_on_device.get(pixel_key, inputs_on_device.get("pixel_values"))
-            else:
-                pixel_values = inputs[pixel_key].to(self._device)
 
             if selected_head is not None:
                 # Multi-head path: run encoder only, then selected head
@@ -908,6 +983,38 @@ class OmniOpenAIServingWorld:
                     logits = outputs.logits
 
             return logits
+
+    def _engine_forward(self, request) -> "FeedForwardOutput":
+        """FeedForwardEngine callback: run inference and return structured output."""
+        from vllm_omni.feed_forward.data import FeedForwardOutput
+
+        clip = request.pixel_values
+        params = request.sampling_params
+        clip_index = params.extra_args.get("clip_index", 0)
+        is_final = params.extra_args.get("is_final", False)
+
+        logits = self._run_clip_inference_sync(
+            clip=clip,
+            is_final=is_final,
+            clip_index=clip_index,
+            head=params.head,
+        )
+
+        # Build predictions from logits
+        id2label = getattr(self._model.config, "id2label", None)
+        head_obj = self._heads.get(params.head) if params.head else None
+        if head_obj is not None and head_obj.label_map:
+            id2label = head_obj.label_map
+
+        probs = torch.softmax(logits[0], dim=-1)
+        topk = torch.topk(probs, k=min(params.top_k, probs.shape[-1]))
+        preds = []
+        for score, idx in zip(topk.values, topk.indices):
+            label = (id2label.get(idx.item(), f"class_{idx.item()}")
+                     if id2label else f"class_{idx.item()}")
+            preds.append({"label": label, "score": round(score.item(), 6)})
+
+        return FeedForwardOutput(logits=logits, predictions=preds)
 
     async def _consume_frames(self, session: Session) -> None:
         """Consume frames from VisionIOProcessor and run model inference.
@@ -1083,40 +1190,64 @@ class OmniOpenAIServingWorld:
 
                 clip, pts_ns, is_final = item
 
-                if self._model is None or self._processor is None:
-                    logger.warning(
-                        "Frame consumer: model=%s, processor=%s - skipping inference",
-                        type(self._model).__name__ if self._model else None,
-                        type(self._processor).__name__ if self._processor else None,
-                    )
+                if self._model is None:
+                    logger.warning("Frame consumer: no model — skipping")
                     continue
 
                 try:
                     clip_index += 1
-                    logits = await asyncio.to_thread(
-                        self._run_clip_inference_sync,
-                        clip, is_final, clip_index, session.head,
+
+                    from vllm_omni.feed_forward.request import (
+                        FeedForwardRequest,
+                        FeedForwardSamplingParams,
+                    )
+                    ff_req = FeedForwardRequest(
+                        request_id=f"{session.session_id}-clip-{clip_index}",
+                        pixel_values=clip,
+                        sampling_params=FeedForwardSamplingParams(
+                            session_id=session.session_id,
+                            head=session.head,
+                            extra_args={"clip_index": clip_index, "is_final": is_final},
+                        ),
                     )
 
-                    # Use head-specific labels if available
-                    id2label = getattr(self._model.config, "id2label", None)
-                    head_obj = self._heads.get(session.head) if session.head else None
-                    if head_obj is not None and head_obj.label_map:
-                        id2label = head_obj.label_map
+                    ff_result = await self._engine.step(ff_req)
 
-                    self.queue_prediction(
-                        session=session,
-                        logits=logits,
-                        pts_ns=pts_ns,
-                        id2label=id2label,
-                    )
+                    if ff_result.logits is not None:
+                        logits = ff_result.logits
+                        id2label = getattr(self._model.config, "id2label", None) if self._model else None
+                        head_obj = self._heads.get(session.head) if session.head else None
+                        if head_obj is not None and head_obj.label_map:
+                            id2label = head_obj.label_map
+                        self.queue_prediction(
+                            session=session, logits=logits,
+                            pts_ns=pts_ns, id2label=id2label,
+                        )
+                    elif ff_result.predictions:
+                        # Subprocess returns predictions directly
+                        from vllm_omni.entrypoints.openai.protocol.world import (
+                            PredictionLabel, WorldPrediction,
+                        )
+                        labels = [
+                            PredictionLabel(label=p["label"], probability=p["score"])
+                            for p in ff_result.predictions
+                        ]
+                        prediction = WorldPrediction(
+                            labels=labels, frame_range=(0, 0),
+                            timestamp_ns=pts_ns, request_id=session.session_id,
+                        )
+                        if session._prediction_queue is not None:
+                            try:
+                                session._prediction_queue.put_nowait(prediction)
+                            except asyncio.QueueFull:
+                                pass
+                        session.predictions_count += 1
 
                     logger.info(
                         "Frame consumer: clip %d done for session %s, "
-                        "logits=%s, next frame_idx=%d, stop=%s",
+                        "next frame_idx=%d, stop=%s",
                         clip_index,
                         session.session_id,
-                        logits.shape,
                         frames_read + 1,
                         session._stop_consumer.is_set(),
                     )
@@ -1448,135 +1579,88 @@ class OmniOpenAIServingWorld:
         obs_timestamp_ms: int | None = None,
         head: str | None = None,
     ) -> dict[str, Any]:
-        """Single-shot video inference (KServe-compatible).
+        """Single-shot video inference via ephemeral session.
 
-        Decodes the video, iterates clips, runs inference on each, and
-        returns all predictions in one response. Mirrors the vjepa2-demo
-        ``/v2/models/vjepa2/infer`` endpoint for benchmark compatibility.
+        Uploads the video, creates a temporary session (uses GStreamer for
+        hardware-accelerated decode), collects all predictions, then cleans up.
+        No PyAV — all decode goes through the session path.
         """
-        import tempfile
         import uuid
 
-        import av
+        # Upload to storage
+        upload = await self.upload_video(content, filename, "video/mp4")
 
-        tracer = get_tracer()
+        # Create ephemeral session
         effective_stride = stride if stride is not None else num_frames
+        session_req = WorldSessionCreateRequest(
+            source=SourceConfigRequest(type=SourceType.FILE, uri=upload.uri),
+            config=WorldSessionConfig(
+                num_frames=num_frames,
+                stride=effective_stride,
+            ),
+        )
+        session_resp = await self.open_session(session_req)
+        session_id = session_resp.session_id
 
-        # Resolve label map
-        id2label = getattr(self._model.config, "id2label", None)
-        head_obj = self._heads.get(head) if head else None
-        if head_obj is not None and head_obj.label_map:
-            id2label = head_obj.label_map
+        try:
+            # Collect all predictions from the session
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise RuntimeError(f"Session {session_id} not found after creation")
 
-        with tracer.start_as_current_span("video_inference") as root_span:
-            if obs_timestamp_ms is not None:
-                root_span.set_attribute("input.obs_timestamp_ms", obs_timestamp_ms)
+            # Set head for this session
+            if head:
+                session.head = head
 
-            with tracer.start_as_current_span("input_receive") as recv_span:
-                recv_span.set_attribute("input.filename", filename)
-                recv_span.set_attribute("input.size_bytes", len(content))
-                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                    tmp.write(content)
-                    tmp_path = tmp.name
+            clips_results: list[dict[str, Any]] = []
+            clip_idx = 0
 
-            try:
-                with tracer.start_as_current_span("input_open") as open_span:
-                    container = av.open(tmp_path)
-                    stream = container.streams.video[0]
-                    open_span.set_attribute("input.codec", stream.codec_context.name)
-                    open_span.set_attribute("input.width", stream.width)
-                    open_span.set_attribute("input.height", stream.height)
-                    if stream.frames:
-                        open_span.set_attribute("input.total_frames", stream.frames)
-                    open_span.set_attribute("input.source_type", "file")
-
-                buffer: list[np.ndarray] = []
-                frame_index = 0
-                next_clip_start = 0
-                clips_results: list[dict[str, Any]] = []
-                clip_idx = 0
-
-                for frame in container.decode(video=0):
-                    buffer.append(frame.to_ndarray(format="rgb24"))
-                    frame_index += 1
-
-                    while len(buffer) >= next_clip_start + num_frames:
-                        clip_frames = np.stack(
-                            buffer[next_clip_start : next_clip_start + num_frames]
-                        )
-                        clip_tensor = torch.from_numpy(clip_frames)
-                        clip_idx += 1
-                        logits = await asyncio.to_thread(
-                            self._run_clip_inference_sync,
-                            clip_tensor, False, clip_idx, head,
-                        )
-                        probs = torch.softmax(logits[0], dim=-1)
-                        topk = torch.topk(probs, k=min(top_k, probs.shape[-1]))
-                        preds = []
-                        for score, idx in zip(topk.values, topk.indices):
-                            label = (
-                                id2label.get(idx.item(), f"class_{idx.item()}")
-                                if id2label else f"class_{idx.item()}"
-                            )
-                            preds.append({"label": label, "score": round(score.item(), 6)})
-                        clips_results.append({
-                            "clip_index": clip_idx - 1,
-                            "start_frame": next_clip_start,
-                            "end_frame": next_clip_start + num_frames,
-                            "partial": False,
-                            "predictions": preds,
-                        })
-                        next_clip_start += effective_stride
-
-                        if stride is None:
-                            break
-
-                    if stride is None and clips_results:
-                        break
-
-                container.close()
-
-                # Trailing frames
-                if next_clip_start < frame_index and buffer and stride is not None:
-                    remaining = buffer[next_clip_start:]
-                    last_frame = remaining[-1]
-                    pad_count = num_frames - len(remaining)
-                    padded = np.stack(remaining + [last_frame] * pad_count)
-                    clip_tensor = torch.from_numpy(padded)
-                    clip_idx += 1
-                    logits = await asyncio.to_thread(
-                        self._run_clip_inference_sync,
-                        clip_tensor, True, clip_idx, head,
+            # Wait for predictions via the session's prediction queue
+            while True:
+                try:
+                    prediction = await asyncio.wait_for(
+                        session._prediction_queue.get(),
+                        timeout=30.0,
                     )
-                    probs = torch.softmax(logits[0], dim=-1)
-                    topk = torch.topk(probs, k=min(top_k, probs.shape[-1]))
-                    preds = []
-                    for score, idx in zip(topk.values, topk.indices):
-                        label = (
-                            id2label.get(idx.item(), f"class_{idx.item()}")
-                            if id2label else f"class_{idx.item()}"
-                        )
-                        preds.append({"label": label, "score": round(score.item(), 6)})
-                    clips_results.append({
-                        "clip_index": clip_idx - 1,
-                        "start_frame": next_clip_start,
-                        "end_frame": frame_index,
-                        "partial": True,
-                        "predictions": preds,
-                    })
+                except asyncio.TimeoutError:
+                    break
 
-                root_span.set_attribute("video.clips_count", len(clips_results))
-                root_span.set_attribute("video.stride", effective_stride)
+                if prediction is None:
+                    break
 
-                model_name = getattr(self._model.config, "_name_or_path", "vjepa2")
-                return {
-                    "model_name": "vjepa2",
-                    "model_version": model_name,
-                    "id": f"req-{uuid.uuid4().hex[:8]}",
-                    "clips": clips_results,
-                }
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
+                # Check for end-of-stream
+                if hasattr(prediction, "status") and prediction.status == "ended":
+                    break
+
+                clip_idx += 1
+                preds = []
+                if hasattr(prediction, "labels") and prediction.labels:
+                    preds = [
+                        {"label": lbl.label, "score": round(lbl.probability, 6)}
+                        for lbl in prediction.labels[:top_k]
+                    ]
+
+                clips_results.append({
+                    "clip_index": clip_idx - 1,
+                    "start_frame": 0,
+                    "end_frame": 0,
+                    "partial": False,
+                    "predictions": preds,
+                })
+
+            model_name = getattr(self._model.config, "_name_or_path", "vjepa2")
+            return {
+                "model_name": "vjepa2",
+                "model_version": model_name,
+                "id": f"req-{uuid.uuid4().hex[:8]}",
+                "clips": clips_results,
+            }
+        finally:
+            # Cleanup ephemeral session
+            try:
+                await self.close_session(session_id)
+            except Exception:
+                logger.debug("Failed to close ephemeral session %s", session_id)
 
     @property
     def gstreamer_available(self) -> bool:

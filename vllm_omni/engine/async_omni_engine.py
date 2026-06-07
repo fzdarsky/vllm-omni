@@ -126,6 +126,9 @@ class StageRuntimeInfo:
     model_stage: str | None = None
 
 
+# Stage types that bypass the LLM engine (no StageEngineCoreProc).
+_NON_LLM_STAGE_TYPES = frozenset({"diffusion", "jepa_encoder", "jepa_predictor"})
+
 # ============================================================================
 # Parent-EngineArgs field-routing contracts (consumed by
 # AsyncOmniEngine._strip_parent_engine_args when ``stage_configs_path`` is set).
@@ -543,7 +546,7 @@ class AsyncOmniEngine:
             replicas: list[ReplicaInitPlan] = []
             stage_vllm_config = None
             executor_class = None
-            if base_metadata.stage_type != "diffusion":
+            if base_metadata.stage_type not in _NON_LLM_STAGE_TYPES:
                 engine_args_dict = build_engine_args_dict(
                     stage_cfg,
                     self.model,
@@ -1148,19 +1151,19 @@ class AsyncOmniEngine:
         }
         primary_exc: Exception | None = None
 
-        # Partition replicas: diffusion runs inline on the caller's thread;
+        # Partition replicas: non-LLM stages (diffusion, JEPA) run inline;
         # LLM replicas are submitted to a scoped ThreadPoolExecutor.
-        diffusion_replicas: list[tuple[int, ReplicaInitPlan]] = []
+        non_llm_replicas: list[tuple[int, ReplicaInitPlan]] = []
         llm_replicas: list[tuple[int, ReplicaInitPlan]] = []
         for plan in stage_plans:
             for replica in plan.replicas:
-                if replica.metadata.stage_type == "diffusion":
-                    diffusion_replicas.append((plan.stage_idx, replica))
+                if replica.metadata.stage_type in _NON_LLM_STAGE_TYPES:
+                    non_llm_replicas.append((plan.stage_idx, replica))
                 else:
                     llm_replicas.append((plan.stage_idx, replica))
 
-        # --- 1) Diffusion replicas: inline on the orchestrator thread. ---
-        for stage_idx, replica in diffusion_replicas:
+        # --- 1) Non-LLM replicas (diffusion, JEPA): inline. ---
+        for stage_idx, replica in non_llm_replicas:
             try:
                 initialized_clients_by_stage[stage_idx][replica.replica_id] = self._initialize_replica(
                     replica,
@@ -1229,7 +1232,7 @@ class AsyncOmniEngine:
             clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
             stage_vllm_config = None
             output_processor = None
-            if plan.replicas[0].metadata.stage_type != "diffusion":
+            if plan.replicas[0].metadata.stage_type not in _NON_LLM_STAGE_TYPES:
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 assert stage_vllm_config is not None
                 output_processor = build_llm_stage_output_processor(plan, stage_vllm_config, log_stats=self._log_stats)
@@ -1299,7 +1302,7 @@ class AsyncOmniEngine:
 
         try:
             initialized_clients_by_stage = self._initialize_stage_replicas(stage_plans, stage_init_timeout)
-            if stage_plans and stage_plans[0].replicas[0].metadata.stage_type != "diffusion":
+            if stage_plans and stage_plans[0].replicas[0].metadata.stage_type not in _NON_LLM_STAGE_TYPES:
                 stage0_vllm_config = stage_plans[0].replicas[0].stage_vllm_config
                 assert stage0_vllm_config is not None
                 input_processor = build_stage0_input_processor(stage0_vllm_config)
