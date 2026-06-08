@@ -30,6 +30,7 @@ except ImportError:
 
 from vllm_omni.feed_forward.data import FeedForwardConfig, FeedForwardOutput
 from vllm_omni.feed_forward.request import FeedForwardRequest
+from vllm_omni.utils.cpu_affinity import pin_to_performance_cores
 
 logger = init_logger(__name__)
 
@@ -105,6 +106,10 @@ class FeedForwardEngine:
 
     def _busy_loop(self):
         """Main processing loop — dispatch requests as they arrive."""
+        # On heterogeneous ARM (big.LITTLE), pin to performance cores to
+        # avoid bimodal latency from scheduler migration between core types.
+        pin_to_performance_cores()
+
         while not self.stop_event.is_set():
             self._process_aborts()
 
